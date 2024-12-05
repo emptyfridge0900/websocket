@@ -57,7 +57,6 @@ async fn main() {
     let app = Router::new()
         .fallback_service(ServeDir::new(assets_dir).append_index_html_on_directories(true))
         .route("/ws", any(ws_handler))
-        .route("/tcp", any(tcp_handler))
         .layer(
             TraceLayer::new_for_http()
                 .make_span_with(DefaultMakeSpan::default().include_headers(true)),
@@ -67,10 +66,11 @@ async fn main() {
     let listener1 = tokio::net::TcpListener::bind("127.0.0.1:3001")
         .await
         .unwrap();
+    tracing::debug!("listening on {}", listener1.local_addr().unwrap());
     tokio::spawn(async move {
         loop {
             // Asynchronously wait for an inbound TcpStream.
-            let (stream, addr) = listener1.accept().await?;
+            let (stream, addr) = listener1.accept().await.unwrap();
 
             // Clone a handle to the `Shared` state for the new connection.
             let state = Arc::clone(&state);
@@ -78,7 +78,7 @@ async fn main() {
             // Spawn our handler to be run asynchronously.
             tokio::spawn(async move {
                 tracing::debug!("accepted connection");
-                if let Err(e) = process(state, stream, addr).await {
+                if let Err(e) = handle_tcp_stream(state, stream, addr).await {
                     tracing::info!("an error occurred; error = {:?}", e);
                 }
             });
@@ -156,7 +156,6 @@ enum MessageSender {
     TcpSocket(OwnedWriteHalf),
 }
 
-async fn tcp_handler(State(state): State<Arc<AppState>>) {}
 async fn ws_handler(
     ws: WebSocketUpgrade,
     user_agent: Option<TypedHeader<headers::UserAgent>>,
@@ -192,6 +191,13 @@ async fn handle_socket(mut socket: WebSocket, who: SocketAddr, state: Arc<AppSta
     let state1 = Arc::clone(&state);
     let state2 = Arc::clone(&state);
 
+    {
+        let mut rooms = state.rooms.lock().unwrap();
+        let msg = format!("{} has joined the chat", who);
+        tracing::info!("{}", msg);
+        let room = rooms.get_mut("chatroom").unwrap();
+        room.broadcast(who, &msg);
+    }
     // Spawn a task that will push several messages to the client (does not matter what client does)
     let mut send_task = tokio::spawn(async move {
         while let Some(Ok(msg)) = receiver.next().await {
@@ -232,58 +238,25 @@ async fn handle_socket(mut socket: WebSocket, who: SocketAddr, state: Arc<AppSta
                 }
             }
         }
-
-        // println!("Sending close to {who}...");
-        // let mut xx = cloned.lock().await;
-        // let sss = xx.get_mut(0);
-        // if let Err(e) = sss
-        //     .unwrap()
-        //     .send(Message::Close(Some(CloseFrame {
-        //         code: axum::extract::ws::close_code::NORMAL,
-        //         reason: Cow::from("Goodbye"),
-        //     })))
-        //     .await
-        // {
-        //     println!("Could not send Close due to {e}, probably it is ok?");
-        // }
     });
 
     // This second task will receive messages from client and print them on server console
     let mut recv_task = tokio::spawn(async move {
-        // let mut cnt = 0;
-        // while let Some(Ok(msg)) = receiver.next().await {
-        //     cnt += 1;
-        //     // print message and break if instructed to do so
-        //     if process_message(msg, who).is_break() {
-        //         break;
-        //     }
-        // }
-        // cnt
         while let Ok(msg) = peer.rx.recv() {
-            println!("Got a message: {}", msg);
+            //println!("Got a message: {}", msg);
             if sender.send(Message::Text(msg)).await.is_err() {
                 println!("Sending message failed");
                 break;
             }
         }
-        0
     });
 
     // If any one of the tasks exit, abort the other.
     tokio::select! {
-        rv_a = (&mut send_task) => {
-            match rv_a {
-                Ok(a) => println!(" messages sent to {who}"),
-                Err(a) => println!("Error sending messages {a:?}")
-            }
+        _ = (&mut send_task) => {
             recv_task.abort();
-
         },
-        rv_b = (&mut recv_task) => {
-            match rv_b {
-                Ok(b) => println!("Received {b} messages"),
-                Err(b) => println!("Error receiving messages {b:?}")
-            }
+        _ = (&mut recv_task) => {
             send_task.abort();
         }
     }
@@ -295,62 +268,21 @@ async fn handle_socket(mut socket: WebSocket, who: SocketAddr, state: Arc<AppSta
         let mut room = state2.rooms.lock().unwrap();
         let room = room.get_mut("chatroom").unwrap();
         room.peers.remove(&who);
+        let msg = format!("{} has left the chat", who);
+        room.broadcast(who, &msg);
+
         println!("{} peer in the room", room.peers.len());
     }
 }
 
-fn process_message(msg: Message, who: SocketAddr) -> ControlFlow<(), ()> {
-    match msg {
-        Message::Text(t) => {
-            println!(">>> {who} sent str: {t:?}");
-        }
-        Message::Binary(d) => {
-            println!(">>> {} sent {} bytes: {:?}", who, d.len(), d);
-        }
-        Message::Close(c) => {
-            if let Some(cf) = c {
-                println!(
-                    ">>> {} sent close with code {} and reason `{}`",
-                    who, cf.code, cf.reason
-                );
-            } else {
-                println!(">>> {who} somehow sent close message without CloseFrame");
-            }
-            return ControlFlow::Break(());
-        }
-
-        Message::Pong(v) => {
-            println!(">>> {who} sent pong with {v:?}");
-        }
-        // You should never need to manually handle Message::Ping, as axum's websocket library
-        // will do so for you automagically by replying with Pong and copying the v according to
-        // spec. But if you need the contents of the pings you can see them here.
-        Message::Ping(v) => {
-            println!(">>> {who} sent ping with {v:?}");
-        }
-    }
-    ControlFlow::Continue(())
-}
-
-async fn process(
+async fn handle_tcp_stream(
     state: Arc<AppState>,
     stream: TcpStream,
     addr: SocketAddr,
 ) -> Result<(), Box<dyn Error>> {
-    let mut lines = Framed::new(stream, LinesCodec::new());
+    let lines = Framed::new(stream, LinesCodec::new());
 
-    // Send a prompt to the client to enter their username.
-    lines.send("Please enter your username:").await?;
-
-    // Read the first line from the `LineCodec` stream to get the username.
-    let username = match lines.next().await {
-        Some(Ok(line)) => line,
-        // We didn't get a line so we return early here.
-        _ => {
-            tracing::error!("Failed to get username from {}. Client disconnected.", addr);
-            return Ok(());
-        }
-    };
+    let (mut tx, mut rx) = lines.split();
 
     {
         let mut rooms = state.rooms.lock().unwrap();
@@ -359,66 +291,62 @@ async fn process(
             .or_insert_with(Room::new);
     }
 
-    let mut peer = Peer::new(addr, "chatroom", state.clone());
-
-    let peer = peer.unwrap();
-    let state1 = Arc::clone(&state);
-    let state2 = Arc::clone(&state);
+    let cloned_state = Arc::clone(&state);
     // Register our peer with state which internally sets up some channels.
-    let mut peer = Peer::new(addr, "chatroom", state.clone())?;
+    let peer = Peer::new(addr, "chatroom", state.clone())?;
 
     // A client has connected, let's let everyone know.
-    // {
-    //     let mut state = state.lock().unwrap();
-    //     let msg = format!("{} has joined the chat", username);
-    //     tracing::info!("{}", msg);
-    //     state.broadcast(addr, &msg).await;
-    // }
+    {
+        let mut rooms = state.rooms.lock().unwrap();
+        let msg = format!("{} has joined the chat", addr);
+        tracing::info!("{}", msg);
+        let room = rooms.get_mut("chatroom").unwrap();
+        room.broadcast(addr, &msg);
+    }
 
+    let mut send_task = tokio::spawn(async move {
+        while let Some(Ok(msg)) = rx.next().await {
+            {
+                println!(">>> {0} sent str: {msg:?}", addr);
+
+                let rooms = cloned_state.rooms.lock();
+                let mut rooms = rooms.unwrap();
+                let room = rooms.get_mut("chatroom").unwrap();
+                room.broadcast(addr, &msg);
+            }
+        }
+    });
+    let mut recv_task = tokio::spawn(async move {
+        while let Ok(msg) = peer.rx.recv() {
+            println!("Got a message: {}", msg);
+            if tx.send(msg).await.is_err() {
+                println!("Sending message failed");
+                break;
+            }
+        }
+    });
     // Process incoming messages until our stream is exhausted by a disconnect.
-    loop {
-        tokio::select! {
-            // A message was received from a peer. Send it to the current user.
-            // Some(msg) = peer.rx.recv() => {
-            //     peer.lines.send(&msg).await?;
-            // }
-            result = lines.next() => match result {
-                // A message was received from the current user, we should
-                // broadcast this message to the other users.
-                Some(Ok(msg)) => {
-                    // let mut state = state.lock().unwrap();
-                    // let msg = format!("{}: {}", username, msg);
 
-                    // state.broadcast(addr, &msg).await;
-
-                    let rooms = state1.rooms.lock();
-                    let mut rooms = rooms.unwrap();
-                    let room = rooms.get_mut("chatroom").unwrap();
-                    room.broadcast(addr, &msg);
-                }
-                // An error occurred.
-                Some(Err(e)) => {
-                    tracing::error!(
-                        "an error occurred while processing messages for {}; error = {:?}",
-                        username,
-                        e
-                    );
-                }
-                // The stream has been exhausted.
-                None => break,
-            },
+    tokio::select! {
+        _ = (&mut send_task) => {
+            recv_task.abort();
+        },
+        _ = (&mut recv_task) => {
+            send_task.abort();
         }
     }
 
     // If this section is reached it means that the client was disconnected!
     // Let's let everyone still connected know about it.
     {
-        let mut state = state.lock().unwrap();
-        state.peers.remove(&addr);
+        let mut rooms = state.rooms.lock().unwrap();
 
-        let msg = format!("{} has left the chat", username);
+        let room = rooms.get_mut("chatroom").unwrap();
+        room.peers.remove(&addr);
+        let msg = format!("{} has left the chat", addr);
+        room.broadcast(addr, &msg);
+        println!("{} peer in the room", room.peers.len());
         tracing::info!("{}", msg);
-        state.broadcast(addr, &msg).await;
     }
 
     Ok(())
